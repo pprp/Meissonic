@@ -1,18 +1,15 @@
 from loguru import logger
 import torch
 import torch.nn as nn
-from torchao.float8.float8_utils import (
-    amax_to_scale,
-    tensor_to_amax,
-    to_fp8_saturated,
-)
 from torch.nn import init
 import math
 from torch.compiler import is_compiling
 from torch import __version__
 from torch.version import cuda
+from diffusers.models.embeddings import CombinedTimestepGuidanceTextProjEmbeddings, CombinedTimestepTextProjEmbeddings,TimestepEmbedding, get_timestep_embedding #,FluxPosEmbed
+from src.transformer import FluxPosEmbed 
 
-breakpoint()
+
 IS_TORCH_2_4 = __version__ < (2, 4, 9)
 LT_TORCH_2_4 = __version__ < (2, 4)
 if LT_TORCH_2_4:
@@ -22,15 +19,12 @@ if LT_TORCH_2_4:
         )
 CUDA_VERSION = float(cuda) if cuda else 0
 
-print(CUDA_VERSION)
 if CUDA_VERSION < 12.4:
     raise RuntimeError(
         f"This version of PyTorch is not supported. Please upgrade to PyTorch 2.4 with CUDA 12.4 or later got torch version {__version__} and CUDA version {cuda}."
     )
 
 from cublas_ops import CublasLinear
-
-
 
 class F8Linear(nn.Module):
 
@@ -93,22 +87,6 @@ class F8Linear(nn.Module):
             "input_scale_reciprocal", None
         )
 
-    def to(self, *args, **kwargs):
-        device, dtype, non_blocking, convert_to_format = torch._C._nn._parse_to(*args, **kwargs)
-        super().to(device=device, dtype=dtype, non_blocking=non_blocking)
-        self.input_amax_trials = self.input_amax_trials.to(device)
-        if self.scale is not None:
-            self.scale = self.scale.to(device)
-        if self.input_scale is not None:
-            self.input_scale = self.input_scale.to(device)
-        if self.float8_data is not None:
-            self.float8_data = self.float8_data.to(device)
-        if self.scale_reciprocal is not None:
-            self.scale_reciprocal = self.scale_reciprocal.to(device)
-        if self.input_scale_reciprocal is not None:
-            self.input_scale_reciprocal = self.input_scale_reciprocal.to(device)
-        return self
-
     def _load_from_state_dict(
         self,
         state_dict,
@@ -141,7 +119,7 @@ class F8Linear(nn.Module):
             ) and sd["weight"] == torch.zeros_like(sd["weight"]):
                 w = sd["weight"]
                 # Set the init values as if it's already quantized float8_data
-                self.float8_data = sd["float8_data"]
+                self._buffers["float8_data"] = sd["float8_data"]
                 self._parameters["weight"] = nn.Parameter(
                     torch.zeros(
                         1,
@@ -172,6 +150,31 @@ class F8Linear(nn.Module):
                     self.input_scale_reciprocal = sd["input_scale_reciprocal"].float()
                     self.input_scale_initialized = True
                     self.trial_index = self.num_scale_trials
+                elif "scale" in sd and "scale_reciprocal" in sd:
+                    self.scale = sd["scale"].float()
+                    self.input_scale = (
+                        sd["input_scale"].float() if "input_scale" in sd else None
+                    )
+                    self.scale_reciprocal = sd["scale_reciprocal"].float()
+                    self.input_scale_reciprocal = (
+                        sd["input_scale_reciprocal"].float()
+                        if "input_scale_reciprocal" in sd
+                        else None
+                    )
+                    self.input_scale_initialized = (
+                        True if "input_scale" in sd else False
+                    )
+                    self.trial_index = (
+                        self.num_scale_trials if "input_scale" in sd else 0
+                    )
+                    self.input_amax_trials = torch.zeros(
+                        self.num_scale_trials,
+                        requires_grad=False,
+                        dtype=torch.float32,
+                        device=self.weight.device,
+                    )
+                    self.input_scale_initialized = False
+                    self.trial_index = 0
                 else:
                     # If scales are not initialized, reset trials
                     self.input_scale_initialized = False
@@ -191,44 +194,58 @@ class F8Linear(nn.Module):
     def quantize_weight(self):
         if self.weight_initialized:
             return
-        amax = tensor_to_amax(self.weight.data)
-        scale = amax_to_scale(amax, self.float8_dtype, self.weight.dtype)
-        self.float8_data = to_fp8_saturated(self.weight.data * scale, self.float8_dtype)
-        self.scale = scale.float()
-        self.weight_initialized = True
-        self.scale_reciprocal = self.scale.reciprocal().float()
+        amax = torch.max(torch.abs(self.weight.data)).float()
+        self.scale = self.amax_to_scale(amax, self.max_value)
+        self.float8_data = self.to_fp8_saturated(
+            self.weight.data, self.scale, self.max_value
+        ).to(self.float8_dtype)
+        self.scale_reciprocal = self.scale.reciprocal()
         self.weight.data = torch.zeros(
             1, dtype=self.weight.dtype, device=self.weight.device, requires_grad=False
         )
+        self.weight_initialized = True
 
     def set_weight_tensor(self, tensor: torch.Tensor):
         self.weight.data = tensor
         self.weight_initialized = False
         self.quantize_weight()
 
+    def amax_to_scale(self, amax, max_val):
+        return (max_val / torch.clamp(amax, min=1e-12)).clamp(max=max_val)
+
+    def to_fp8_saturated(self, x, scale, max_val):
+        return (x * scale).clamp(-max_val, max_val)
+
     def quantize_input(self, x: torch.Tensor):
         if self.input_scale_initialized:
-            return to_fp8_saturated(x * self.input_scale, self.input_float8_dtype)
+            return self.to_fp8_saturated(x, self.input_scale, self.input_max_value).to(
+                self.input_float8_dtype
+            )
         elif self.trial_index < self.num_scale_trials:
-            amax = tensor_to_amax(x)
-            new_trials = self.input_amax_trials.clone()
-            new_trials[self.trial_index] = amax.clone().detach()
-            self.input_amax_trials = new_trials
+            amax = torch.max(torch.abs(x)).float()
+
+            # Create a new tensor instead of modifying in-place
+            new_input_amax_trials = self.input_amax_trials.clone()
+            new_input_amax_trials[self.trial_index] = amax.clone().detach()
+            self.input_amax_trials = new_input_amax_trials
+
             self.trial_index += 1
-            self.input_scale = amax_to_scale(
-                self.input_amax_trials[: self.trial_index].max(),
-                self.input_float8_dtype,
-                self.weight.dtype,
+            self.input_scale = self.amax_to_scale(
+                self.input_amax_trials[: self.trial_index].max(), self.input_max_value
             )
             self.input_scale_reciprocal = self.input_scale.reciprocal()
-            return to_fp8_saturated(x * self.input_scale, self.input_float8_dtype)
+            return self.to_fp8_saturated(x, self.input_scale, self.input_max_value).to(
+                self.input_float8_dtype
+            )
         else:
-            self.input_scale = amax_to_scale(
-                self.input_amax_trials.max(), self.input_float8_dtype, self.weight.dtype
+            self.input_scale = self.amax_to_scale(
+                self.input_amax_trials.max(), self.input_max_value
             )
             self.input_scale_reciprocal = self.input_scale.reciprocal()
             self.input_scale_initialized = True
-            return to_fp8_saturated(x * self.input_scale, self.input_float8_dtype)
+            return self.to_fp8_saturated(x, self.input_scale, self.input_max_value).to(
+                self.input_float8_dtype
+            )
 
     def reset_parameters(self) -> None:
         if self.weight_initialized:
@@ -256,10 +273,8 @@ class F8Linear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.input_scale_initialized or is_compiling():
-            x = (
-                x.mul(self.input_scale)
-                .clamp(min=-self.input_max_value, max=self.input_max_value)
-                .type(self.input_float8_dtype)
+            x = self.to_fp8_saturated(x, self.input_scale, self.input_max_value).to(
+                self.input_float8_dtype
             )
         else:
             x = self.quantize_input(x)
@@ -267,10 +282,11 @@ class F8Linear(nn.Module):
         prev_dims = x.shape[:-1]
         x = x.view(-1, self.in_features)
 
+        # float8 matmul, much faster than float16 matmul w/ float32 accumulate on ADA devices!
         out = torch._scaled_mm(
             x,
             self.float8_data.T,
-            scale_a=self.input_scale_reciprocal.to(x.device),
+            scale_a=self.input_scale_reciprocal,
             scale_b=self.scale_reciprocal,
             bias=self.bias,
             out_dtype=self.weight.dtype,
@@ -391,69 +407,84 @@ def quantize_transformer2d_and_dispatch_float8(
 
     if swap_linears_with_cublaslinear is true, and transformer_dtype == torch.float16, then swap all linears with cublaslinears for 2x performance boost on consumer GPUs.
     Otherwise will skip the cublaslinear swap.
+
+    Embedding layers are not quantized.
     """
+    # 处理transformer_blocks
     for module in transformer_model.transformer_blocks:
-        module.to(device)
-        module.eval()
+        module.to(device)  # 将模块移动到指定设备
+        module.eval()  # 设置模块为评估模式
         recursive_swap_linears(
             module,
             float8_dtype=float8_dtype,
             input_float8_dtype=input_float8_dtype,
-        )
-        torch.cuda.empty_cache()
+        )  # 递归替换线性层为FP8
+        torch.cuda.empty_cache()  # 清理GPU缓存
+
+    # 处理single_transformer_blocks
     for module in transformer_model.single_transformer_blocks:
-        module.to(device)
-        module.eval()
+        module.to(device)  # 将模块移动到指定设备
+        module.eval()  # 设置模块为评估模式
         recursive_swap_linears(
             module,
             float8_dtype=float8_dtype,
             input_float8_dtype=input_float8_dtype,
-        )
-        torch.cuda.empty_cache()
-    to_gpu_extras = [
-        "project_to_hidden_norm",
-        "project_to_hidden",
-        "project_from_hidden_norm",
-        "project_from_hidden",
-        "down_block",
-        "up_block",
-    ]
-    for module in to_gpu_extras:
-        m_extra = getattr(transformer_model, module)
-        if m_extra is None:
-            continue
-        m_extra.to(device)
-        m_extra.eval()
-        if isinstance(m_extra, nn.Linear) and not isinstance(
-            m_extra, (F8Linear, CublasLinear)
-        ):
-            setattr(
-                transformer_model,
-                module,
-                F8Linear.from_linear(
-                    m_extra,
-                    float8_dtype=float8_dtype,
-                    input_float8_dtype=input_float8_dtype,
-                ),
-            )
-            del m_extra
-        else:
-            recursive_swap_linears(
-                m_extra,
-                float8_dtype=float8_dtype,
-                input_float8_dtype=input_float8_dtype,
-            )
-        torch.cuda.empty_cache()
-    if (
-        swap_linears_with_cublaslinear
-        and transformer_dtype == torch.float16
-        and isinstance(CublasLinear, type(torch.nn.Linear))
-    ):
-        swap_to_cublaslinear(transformer_model)
-    elif swap_linears_with_cublaslinear and transformer_dtype != torch.float16:
-        logger.warning("Skipping cublas linear swap because transformer_dtype is not float16")
+        )  # 递归替换线性层为FP8
+        torch.cuda.empty_cache()  # 清理GPU缓存
+
+    # 定义需要额外处理的模块列表
+    # to_gpu_extras = [
+    #     "project_to_hidden_norm",
+    #     "project_to_hidden",
+    #     "project_from_hidden_norm",
+    #     "project_from_hidden",
+    #     "down_block",
+    #     "up_block",
+    # ]
+
+    # # 处理额外模块
+    # for module in to_gpu_extras:
+    #     m_extra = getattr(transformer_model, module)
+    #     if m_extra is None:
+    #         continue
+    #     m_extra.to(device)  # 将模块移动到指定设备
+    #     m_extra.eval()  # 设置模块为评估模式
+        
+    #     # 如果是线性层且不是特定类型，则替换为F8Linear
+    #     print('==============', type(m_extra))
+    #     if isinstance(m_extra, nn.Linear) and not isinstance(m_extra, (F8Linear, CublasLinear)):
+    #         setattr(
+    #             transformer_model,
+    #             module,
+    #             F8Linear.from_linear(
+    #                 m_extra,
+    #                 float8_dtype=float8_dtype,
+    #                 input_float8_dtype=input_float8_dtype,
+    #             ),
+    #         )
+    #         del m_extra
+    #     # 如果不是Embedding层或其他特定类型，则递归替换线性层
+    #     elif not isinstance(m_extra, (CublasLinear, nn.Embedding, FluxPosEmbed, CombinedTimestepGuidanceTextProjEmbeddings, CombinedTimestepTextProjEmbeddings, TimestepEmbedding)):
+    #         recursive_swap_linears(
+    #             m_extra,
+    #             float8_dtype=float8_dtype,
+    #             input_float8_dtype=input_float8_dtype,
+    #         )
+    #     torch.cuda.empty_cache()  # 清理GPU缓存
+
+    # # 如果满足条件，将线性层替换为CublasLinear
+    # if (
+    #     swap_linears_with_cublaslinear
+    #     and transformer_dtype == torch.float16
+    #     and isinstance(CublasLinear, type(torch.nn.Linear))
+    # ):
+    #     swap_to_cublaslinear(transformer_model)
+    # elif swap_linears_with_cublaslinear and transformer_dtype != torch.float16:
+    #     logger.warning("跳过cublas线性层替换，因为transformer_dtype不是float16")
+
+    # 如果需要卸载transformer，将其移动到CPU
     if offload_transformer:
         transformer_model.to("cpu")
-        torch.cuda.empty_cache()
-    return transformer_model
+        torch.cuda.empty_cache()  # 清理GPU缓存
 
+    return transformer_model

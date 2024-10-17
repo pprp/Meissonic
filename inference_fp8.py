@@ -13,17 +13,22 @@ from transformers import (
 )
 from diffusers import VQModel
 import time
-from quantize_fp8 import quantize_transformer2d_and_dispatch_float8, F8Linear, recursive_swap_linears
+from quantize_fp8 import quantize_transformer2d_and_dispatch_float8, recursive_swap_linears
 
 device = 'cuda'
 
 def load_fp8_models(use_gpu=True):
     model_path = "MeissonFlow/Meissonic"
-    model = Transformer2DModel.from_pretrained(model_path, subfolder="transformer")
-    vq_model = VQModel.from_pretrained(model_path, subfolder="vqvae")
-    text_encoder = CLIPTextModelWithProjection.from_pretrained("laion/CLIP-ViT-H-14-laion2B-s32B-b79K")
+    model = Transformer2DModel.from_pretrained(model_path, subfolder="transformer", torch_dtype=torch.float16)
+    vq_model = VQModel.from_pretrained(model_path, subfolder="vqvae", torch_dtype=torch.float16)
+    text_encoder = CLIPTextModelWithProjection.from_pretrained("laion/CLIP-ViT-H-14-laion2B-s32B-b79K", torch_dtype=torch.float16)
     tokenizer = CLIPTokenizer.from_pretrained(model_path, subfolder="tokenizer")
     scheduler = Scheduler.from_pretrained(model_path, subfolder="scheduler")
+
+
+    # Quantize vq vae model 
+    from quantize_fp8 import recursive_swap_linears
+    recursive_swap_linears(vq_model)
 
     # Quantize models to FP8
     model_fp8 = quantize_transformer2d_and_dispatch_float8(
@@ -36,9 +41,9 @@ def load_fp8_models(use_gpu=True):
         transformer_dtype=torch.float16
     )
     
-    # Convert other models to FP8
-    vq_model = convert_model_to_fp8(vq_model)
-    text_encoder = convert_model_to_fp8(text_encoder)
+    # Do Not Convert other models to FP8
+    # vq_model = convert_model_to_fp8(vq_model)
+    # text_encoder = convert_model_to_fp8(text_encoder)
 
     pipe = Pipeline(vq_model, tokenizer=tokenizer, text_encoder=text_encoder, transformer=model_fp8, scheduler=scheduler)
     return pipe.to(device if use_gpu else 'cpu')
