@@ -432,6 +432,7 @@ def quantize_transformer2d_and_dispatch_float8(
         )  # 递归替换线性层为FP8
         torch.cuda.empty_cache()  # 清理GPU缓存
 
+    # 打开这部分压缩会导致性能损失严重；
     # 定义需要额外处理的模块列表
     # to_gpu_extras = [
     #     "project_to_hidden_norm",
@@ -441,7 +442,6 @@ def quantize_transformer2d_and_dispatch_float8(
     #     "down_block",
     #     "up_block",
     # ]
-
     # # 处理额外模块
     # for module in to_gpu_extras:
     #     m_extra = getattr(transformer_model, module)
@@ -471,16 +471,6 @@ def quantize_transformer2d_and_dispatch_float8(
     #             input_float8_dtype=input_float8_dtype,
     #         )
     #     torch.cuda.empty_cache()  # 清理GPU缓存
-
-    # # 如果满足条件，将线性层替换为CublasLinear
-    # if (
-    #     swap_linears_with_cublaslinear
-    #     and transformer_dtype == torch.float16
-    #     and isinstance(CublasLinear, type(torch.nn.Linear))
-    # ):
-    #     swap_to_cublaslinear(transformer_model)
-    # elif swap_linears_with_cublaslinear and transformer_dtype != torch.float16:
-    #     logger.warning("跳过cublas线性层替换，因为transformer_dtype不是float16")
 
     # 如果需要卸载transformer，将其移动到CPU
     if offload_transformer:
