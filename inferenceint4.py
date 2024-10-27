@@ -14,7 +14,7 @@ from transformers import (
 from diffusers import VQModel
 import time
 import argparse
-from quantize_fp8 import quantize_transformer2d_and_dispatch_float8, recursive_swap_linears
+# from quantize_fp8 import quantize_transformer2d_and_dispatch_float8, recursive_swap_linears
 
 from torchao.quantization.quant_api import (
     quantize_,
@@ -52,7 +52,7 @@ def load_models(precision, quantization_method=None, group_size=32):
         "laion/CLIP-ViT-H-14-laion2B-s32B-b79K",
         torch_dtype=dtype
     )
-    tokenizer = CLIPTokenizer.from_pretrained(model_path, subfolder="tokenizer")
+    tokenizer = CLIPTokenizer.from_pretrained(model_path, subfolder="tokenizer", torch_dtype=dtype)
     scheduler = Scheduler.from_pretrained(model_path, subfolder="scheduler")
     
     if quantization_method:
@@ -62,16 +62,16 @@ def load_models(precision, quantization_method=None, group_size=32):
         else:
             print(f"Unsupported quantization method: {quantization_method}")
 
-    if precision == 'fp8':
-        model = quantize_transformer2d_and_dispatch_float8(
-            model,
-            device=torch.device(device),
-            float8_dtype=torch.float8_e4m3fn,
-            input_float8_dtype=torch.float8_e5m2,
-            offload_transformer=False,
-            swap_linears_with_cublaslinear=True,
-            transformer_dtype=torch.float16
-        )
+    # if precision == 'fp8':
+    #     model = quantize_transformer2d_and_dispatch_float8(
+    #         model,
+    #         device=torch.device(device),
+    #         float8_dtype=torch.float8_e4m3fn,
+    #         input_float8_dtype=torch.float8_e5m2,
+    #         offload_transformer=False,
+    #         swap_linears_with_cublaslinear=True,
+    #         transformer_dtype=torch.float16
+    #     )
     
     pipe = Pipeline(vq_model, tokenizer=tokenizer, text_encoder=text_encoder, transformer=model, scheduler=scheduler)
     return pipe.to(device)
